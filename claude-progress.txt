@@ -1,0 +1,158 @@
+Date: 2026-05-22
+TaskStatus: completed
+
+Task scope:
+  让 lerobot-eval 用调用远程 vLLM(vllm-omni GR00T-N1.7 OpenPI WebSocket API) 的 policy，
+  在本地 macOS 上用本地 LIBERO 运行评测；uv 管理环境。
+  目标命令：
+    lerobot-eval --policy.path=vllm_groot_policy --env.type=libero --env.task=libero_object \
+      --eval.batch_size=1 --eval.n_episodes=2 --policy.n_action_steps=10 --output_dir=./outputs/libero_eval
+
+Current summary:
+  - 已完成全面调研（lerobot eval/policy/env 机制、vllm-omni GR00T OpenPI API、LIBERO macOS fork）。
+  - 已建立需求账本 feature_list.md（F1..F10）。
+  - 尚未开始编码。
+  - 已确认 lerobot 仓库已内置 `groot` policy 与 `libero` env；本任务新增的是「调用远程 vLLM 的
+    vllm_groot policy」，复用既有 libero env。
+
+Decisions (用户确认):
+  - 保持 lerobot 上游**完全不改**（含原有 policy）。只新增独立插件包。
+    用 lerobot 内置的第三方插件机制：register_third_party_plugins() 在 lerobot-eval main() 中
+    自动 import 名为 lerobot_policy_* 的已安装发行包 → 触发 draccus 注册。
+  - 让本地 LIBERO 适配 Python 3.12（LIBERO requires-python 放宽为 >=3.10）。
+    新建 lerobot/.venv (3.12)；egl-probe 用 uv --overrides 在非 Linux 丢弃。
+  - 关键 env-only 修复：pin transformers==5.3.0（5.9 把 PretrainedConfig 变成 dataclass，
+    触发 lerobot groot 的 GR00TN15Config 定义崩溃；5.3.0 不是 dataclass，groot 正常 import）。
+  - 真实推理用 mock server 本地冒烟（无 GPU）。
+
+F1 状态: completed
+  - lerobot/.venv (3.12)：lerobot + 本地 LIBERO(editable) + websockets + msgpack-numpy + transformers==5.3.0
+  - 验证：import 全通过；`lerobot-eval --help` 正常（env.type 含 libero）。
+
+架构 (零改 lerobot)：
+  - 插件包：lerobot/vllm_groot_plugin/ (dist=lerobot_policy_vllm_groot)
+      configuration_vllm_groot.py / modeling_vllm_groot.py / processor_vllm_groot.py / client.py / mock_server.py
+  - --policy.path 目录：lerobot/vllm_groot_policy/ (config.json + policy_preprocessor.json + policy_postprocessor.json)
+  - 重要约束：libero env 强制走 LiberoProcessorStep，state 被压成 8 维
+    [eef_pos(3), eef_axisangle(3), gripper(2)]；joint_pos / eef_mat 被丢弃。
+    => 编码器从 8 维重建 eef_9d(xyz+rot6d) 与 gripper；joint_position 暂用 0 填充（已记 caveat）。
+
+F2..F10 状态: 全部 completed。
+  - 插件 lerobot_policy_vllm_groot 安装即被 register_third_party_plugins() 自动注册。
+  - F9：精确目标命令 exit 0；outputs/libero_eval/eval_info.json（10 任务×2 集=20 episodes，
+    per_task/per_group/overall）；pc_success=0.0 属预期（mock no-op 动作）。
+  - 验证：lerobot 仓库无任何被修改的已跟踪文件（仅新增未跟踪 vllm_groot_plugin/、vllm_groot_policy/ 等）。
+
+复跑步骤（手动验证）见 vllm_groot_plugin/README.md：
+  1. 启动 mock： .venv/bin/python -m lerobot_policy_vllm_groot.mock_server --host 127.0.0.1 --port 8000
+  2. 跑目标命令（见 README 第 3 节）。
+  真实推理：起远程 GR00T server，跑命令时加 --policy.host=<IP> --policy.port=8000。
+
+真实服务实验 (2026-05-22, 远程 GR00T via VS Code :8000 端口转发):
+  - 端到端跑通：lerobot-eval -> vllm_groot -> 真实 GR00T(libero_sim) -> LIBERO；
+    真实推理 ~1.2s/call，~43s/episode；reduced run (1 任务1 集) exit 0。
+  - 两个必需修复（已落地）：
+    (1) images 必须发**列表** [external_0, wrist]，不能发 dict（服务端直接喂 HF image processor）。
+        config 新增 images_as_list=True；_build_request 改为发列表。
+    (2) 序列化必须用 **OpenPI 的 msgpack-numpy 格式**（__ndarray__ 信封），与标准 msgpack-numpy 包
+        的 nd/type/kind 格式不兼容。已**内置(vendor)**进 client.py，不依赖 openpi-client
+        （后者 pin numpy<2，与 lerobot 冲突）。numpy 维持 2.2.6。
+  - 默认 embodiment 改为 libero_sim（LIBERO 专用 projector id 2）。
+  - 当前 pc_success=0 的真正原因（已查明）：
+    (a) 服务端加载的是 **base** nvidia/GR00T-N1.7-3B；LIBERO 是 posttrain embodiment，
+        需换成 **nvidia/GR00T-N1.7-LIBERO**（服务端：MODEL=nvidia/GR00T-N1.7-LIBERO 重启）。
+        已通过 /v1/models 确认当前 root=nvidia/GR00T-N1.7-3B。
+    (b) 之前 client 用了错误的 DROID eef_9d 约定。已改为 **LIBERO 原生 7 维约定**（权威来源
+        Isaac-GR00T/gr00t/eval/sim/LIBERO/libero_env.py 与 examples/LIBERO/modality.json）：
+        - modality/state/action key = x,y,z,roll,pitch,yaw,gripper（state.gripper 2 维）。
+        - state 直接来自 lerobot LiberoProcessorStep 的 8 维 [eef_pos,axisangle,gripper_qpos]，
+          图像已 180° 翻转（与 Isaac-GR00T 的 [::-1,::-1] 一致）→ flip_images_180=False。
+        - images 必须发**列表** [agentview, eye_in_hand]。
+        - 动作：Isaac-GR00T 把模型输出当作**delta**直接喂 env.step(relative)；gripper 做
+          normalize([0,1]->[-1,1])->sign->invert。
+        - vllm-omni 服务端 decode 会 **+raw_state**（已用 state.x=100 实测确认，返回≈100）→
+          返回的是 current+delta（绝对）。故 client 用 decode_subtract_state=True 还原 delta，
+          再走 LIBERO relative 控制；gripper 减去 state 后再 normalize/sign/invert。
+      => client 侧已就绪：select_action→(1,7) 有限且∈[-1,1]。
+
+  序列化关键修复：服务端用 openpi 的 msgpack-numpy 格式（__ndarray__ 信封），与标准 msgpack-numpy
+  包不兼容；已**vendor**进 client.py（不引 openpi-client，避免 numpy<2 冲突）。
+
+  ✅ 真实成功 (2026-05-22)：服务端换成 nvidia/GR00T-N1.7-LIBERO 的 **libero_object** 子检查点
+     (/data/models/GR00T-N1.7-LIBERO/libero_object) 后，reduced run (task 0, 2 集) **pc_success=100%**
+     (successes=[True,True])，机器人真实完成任务。~26s/episode。
+     注意：每个 LIBERO suite 有独立子检查点（libero_10/goal/object/spatial），需与 --env.task 匹配。
+  ✅ 完整 libero_object（10 任务×2 集=20 episodes）：**pc_success=100%**（每个任务 2/2），~466s。
+     outputs/libero_eval/eval_info.json。
+  ✅ 单任务可视化：vllm_plugin/scripts/eval_visualize.py（复用 VllmPolicy + LIBERO RerunViewer），
+     task0 SUCCESS@step134；--open-browser 实时 web viewer，或 --save x.rrd 离线查看。
+
+  🔧 可视化解耦 (2026-05-26)：vllm_plugin/scripts/eval_visualize.py 完全去掉对 LIBERO RerunViewer 的
+     依赖；改用 lerobot 自带的 utils.visualization_utils.log_rerun_data + rr.serve_grpc/web_viewer。
+     默认 web viewer（--open-browser 弹浏览器；--spawn 走桌面；--save x.rrd 离线录制）。
+     entity 树是 lerobot 标准：observation.{images.*, state_*, reward, done, success} +
+     action.{dx,dy,dz,droll,dpitch,dyaw,gripper}；时间线 "step"。8.9MB .rrd 验证通过。
+
+  📁 In-place 布局重构 (2026-05-26)：把所有源码搬到 lerobot 自然位置（仍然全部 additive，不改既有文件）：
+       src/lerobot/policies/vllm/        ← policy 源码（跟 act/ groot/ 同级）
+       src/lerobot/envs/maniskill.py     ← env 源码（跟 libero.py 同级）
+       examples/vllm_policy/             ← --policy.path 配置 + scripts/{generate_policy_dir,eval_visualize}.py
+       plugins/lerobot_policy_vllm/      ← 5 行 shim dist；唯一带 lerobot_policy_ 前缀的存在，
+                                          作用是触发 register_third_party_plugins 把上面两个 module import
+     - 老目录 vllm_plugin/ / maniskill_env_plugin/ / vllm_policy/ 已删除。
+     - 命令变化：`uv pip install -e plugins/lerobot_policy_vllm` /
+                   `--policy.path=examples/vllm_policy` /
+                   `python examples/vllm_policy/scripts/eval_visualize.py ...` /
+                   `python -m lerobot.policies.vllm.mock_server ...`
+     - 验证：lerobot-eval --help 中 vllm 出现在 --policy.type，maniskill 出现在 --env.type；
+       mock 端到端 lerobot-eval 跑通；viz --save 写出 4.97MB .rrd。lerobot upstream 跟踪文件 0 修改。
+
+  🆕 ManiSkill env 骨架 (2026-05-26)：新插件 maniskill_env_plugin/（dist=lerobot_env_maniskill）。
+     注册 @EnvConfig.register_subclass("maniskill")，走 lerobot 通用 gym.make 路径
+     （package_name="mani_skill.envs", gym_id=cfg.task，例如 "PickCube-v1"）。
+     插件自动发现 hack：lerobot 只扫 lerobot_robot_/camera_/teleoperator_/policy_ 前缀（无 _env_），
+     所以让 lerobot_policy_vllm/__init__.py best-effort import lerobot_env_maniskill 来触发注册。
+     mac 验证 5 条 acceptance 全部通过；`lerobot-eval --help` 现在 --env.type 选项包含 maniskill。
+     **未完成的部分（留给 Linux 端）**：ManiSkill 的嵌套 obs（agent.qpos / sensor_data.*）
+     需要一个 ManiskillProcessorStep 才能跑 rollout——lerobot 的 make_env_pre_post_processors 是
+     硬编码到 libero/isaaclab_arena，需在 Linux 上要么 monkey-patch、要么写 gym wrapper 预扁平化 obs。
+
+  🔧 Rename (2026-05-26)：插件去掉 "groot"，让名字更通用（OpenPI 协议本身不限定模型）：
+     - 目录 vllm_groot_plugin/ → vllm_plugin/
+     - dist lerobot_policy_vllm_groot → lerobot_policy_vllm（仍由 lerobot_policy_* 前缀自动发现）
+     - 类 VllmGrootConfig/Policy → VllmConfig/Policy；GrootOpenPIClient → OpenPIClient
+     - 工厂 make_vllm_groot_pre_post_processors → make_vllm_pre_post_processors
+     - draccus 类型 "vllm_groot" → "vllm"
+     - --policy.path 目录 vllm_groot_policy/ → vllm_policy/
+     已验证：register_third_party_plugins → get_policy_class("vllm") → VllmPolicy；
+     mock 端到端 lerobot-eval (libero_object task0) exit 0，eval_info.json 写出。
+     真服务的 :8000 转发当前断开（用户重启端口或网络变化）；恢复后跑目标命令即可（README 第 3 节）。
+
+⏸️ Deferred to Linux+GPU 机器（不在 mac 上提前做，因为无法验证）:
+  - examples/vllm_policy/scripts/eval_visualize.py 当前 env 处理写死 LIBERO（make_env /
+    set_init_state / robot0_* obs key / 4-tuple step）。Rerun 那一段（_init_rerun / _log_step）
+    是 env-agnostic 的。Linux 上把 LIBERO 部分抽成 _env_libero.py，加 _env_maniskill.py
+    适配器（ManiSkill 用 gym.make + nested obs flattening + 5-tuple step），共用 Rerun 段。
+  - 同步要做：ManiskillProcessorStep（参照 IsaaclabArenaProcessorStep），或 gym.Wrapper
+    在 env 层就把嵌套 obs 扁平化（避免改 lerobot 的 make_env_pre_post_processors）。
+  - GR00T checkpoint：当前 nvidia/GR00T-N1.7-LIBERO 不会给 ManiSkill 出正确动作。要么等
+    NVIDIA 出 ManiSkill 版本，要么用 ManiSkill 数据 finetune 自己的。
+
+Main gaps / 后续可改进（不阻塞）：
+  1. joint_position 无法从 lerobot 默认 LIBERO 处理链获得（被 LiberoProcessorStep 丢弃）→ 暂填 0。
+  2. GR00T 绝对动作 → LIBERO 7 维 delta 的转换为近似实现，真实精度需对接真服务后校准（mock 冒烟不受影响）。
+  3. transformers==5.3.0 为手动 pin（未写进 lockfile）；如重装环境需重新 pin（README 已记）。
+
+Next steps（如需）：
+  - 对接真实远程 GR00T server 校准动作解码与 embodiment/modality。
+  - 视需要把 transformers==5.3.0 固化进环境 lock。
+  2. GR00T 真服务需 CUDA GPU，本机 macOS 无法本地起真服务：
+     需 mock server 做本地协议冒烟（F8），真实推理指向远程 GPU server。
+  3. 动作空间映射：GR00T 输出绝对 eef_9d/gripper/joint，LIBERO 需 7 维 delta 动作，需实现合理转换。
+
+Next steps:
+  1. (已问用户) 确认 Python/env 策略 与 是否有远程 server。
+  2. F1：建立 uv 单环境（lerobot editable + 本地 LIBERO editable + websockets/msgpack-numpy）。
+  3. F2：注册 vllm_groot policy 骨架。
+  4. F8：mock server，便于后续 F4/F9 本地测试。
+  5. 依序推进 F3/F4/F5/F6/F7，最后 F9 端到端、F10 文档。
