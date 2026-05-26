@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Shim distribution: exists solely so that lerobot's `register_third_party_plugins()`
+# (which scans installed dists with `lerobot_robot_/camera_/teleoperator_/policy_`
+# prefixes) finds and imports it on startup. The actual policy and env code lives at:
+#   - src/lerobot/policies/vllm/        (the `vllm` policy)
+#   - src/lerobot/envs/maniskill.py     (the `maniskill` env)
+# The dist itself has no functional code — only a 4-line side-effect __init__.py.
+name = "lerobot_policy_vllm"
+version = "0.1.0"
+description = "Auto-discovery shim that registers the in-tree vllm policy and maniskill env with lerobot."
+requires-python = ">=3.10"
+dependencies = [
+    # The real policy/env code is shipped INSIDE lerobot's own src tree (`src/lerobot/`),
+    # so we don't redeclare lerobot here. Network/serialization deps used by the policy:
+    "websockets>=12.0",
+    "msgpack",
+    "numpy>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lerobot_policy_vllm*"]
