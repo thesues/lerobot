@@ -66,6 +66,11 @@ class SOFollowerEndEffectorConfig(SOFollowerRobotConfig):
     # the arm moves. None → capture from the HOME pose on (re)connect / after HOME.
     # The bundled URDF's HOME elevation is ~0° (gripper pointing horizontally forward).
     hold_pitch_deg: float | None = None
+    # Per-tick step for the direct per-motor joint jog (web_ee right-side panel:
+    # ``joint_<motor>`` actions). Degrees for the arm joints; raw 0–100 units for the
+    # gripper. This path bypasses the IK entirely — the recommended way to drive the
+    # 5-DoF arm. Hold a button to keep jogging that motor.
+    joint_jog_step_deg: float = 2.0
     # Hard cap on per-joint motion per tick (degrees), applied AFTER IK.
     # Only triggers when IK output jumps more than this between ticks (i.e.
     # the rare branch-flip near singularities); normal jogging is unaffected.

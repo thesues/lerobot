@@ -434,13 +434,19 @@ class SOFollowerEndEffector(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return {
+        # EE-delta keys drive the IK pipeline (left "demo" panel of web_ee);
+        # joint_<motor> keys drive a direct per-motor jog that bypasses IK
+        # (right panel — the recommended way to drive this 5-DoF arm).
+        feats: dict[str, type] = {
             "delta_x": float,
             "delta_y": float,
             "delta_z": float,
             "delta_roll": float,
             "gripper": float,
         }
+        for motor in self._inner.bus.motors:
+            feats[f"joint_{motor}"] = float
+        return feats
 
     @property
     def is_connected(self) -> bool:
@@ -476,6 +482,30 @@ class SOFollowerEndEffector(Robot):
                 self._pipeline.reset()
             self._last_joint_action = dict(home_action)
             return result
+
+        # Direct per-motor jog (web_ee right panel) — bypass the IK entirely. Each
+        # joint_<motor> ∈ {−1, 0, +1} nudges that motor by joint_jog_step_deg, layered
+        # on the last commanded target so holding a button integrates smoothly.
+        motor_names = list(self._inner.bus.motors.keys())
+        joint_deltas = {m: float(action.get(f"joint_{m}", 0.0)) for m in motor_names}
+        if any(v != 0.0 for v in joint_deltas.values()):
+            if self._last_joint_action is not None:
+                base = dict(self._last_joint_action)
+            else:
+                obs = self._inner.get_observation()
+                base = {f"{m}.pos": float(obs[f"{m}.pos"]) for m in motor_names}
+            step = self.config.joint_jog_step_deg
+            target: dict[str, float] = {}
+            for m in motor_names:
+                pos = float(base.get(f"{m}.pos", 0.0)) + joint_deltas[m] * step
+                if m == "gripper":
+                    pos = min(max(pos, 0.0), 100.0)
+                target[f"{m}.pos"] = pos
+            # Reset the EE pipeline so a later EE jog re-latches from the new pose.
+            if self._pipeline is not None:
+                self._pipeline.reset()
+            self._last_joint_action = dict(target)
+            return self._inner.send_action(target)
 
         is_idle = (
             float(action.get("delta_x", 0.0)) == 0.0

@@ -1,7 +1,26 @@
 Date: 2026-05-29
 TaskStatus: completed
 
-Task scope (F12):
+Task scope (F12 终态):
+  web_ee 做成左右双面板：左 = EE 控制(4-DoF IK)，作为「demo / bad case」；
+  右 = 12 个按钮(6 电机 × ±)直接关节 jog 控制全部电机(推荐，绕过 IK)。
+  用户结论：SO-100 不适合 EEF 控制，最佳遥操是直接控制电机。
+
+Current summary (F12 双面板):
+  - 右栏「直接关节遥操」(新增, 推荐路径)：
+    teleop 发 joint_<motor> ∈ {-1,0,+1}(6 电机)；robot.send_action 新增分支：任一非零即绕过 IK，
+    按 joint_jog_step_deg(默认 2°) 在上次目标上累加，gripper 夹 [0,100]，并 reset EE pipeline。
+    UI: .cols 两栏；左 EE(badge"demo·bad case")，右 12 按钮(badge"recommended")。
+  - 左栏「EE 控制」(保留为对照 demo)：4-DoF IK(位置+自动保持 HOME 仰角，不下垂) + Roll(wrist_roll) + 夹爪。
+  - 验证(venv 离线全通过)：
+    teleop action_features 含 5 EE 键 + 6 joint_ 键；UI 12 个 j_* 按钮 + 两个 badge；
+    EE pipeline 伺服闭环：15×+Y 仰角保持 +0.03°、5×roll wrist_roll 0→10°；
+    直接关节 jog(stub bus)：单电机累加 0→2→…→10、其余保持、gripper 100 封顶。
+  - 待真机验证：右栏 12 按钮逐电机方向/范围；左栏 EE 作为对照。
+
+(以下为前序演进记录，保留备查：)
+
+Task scope (F12 前序):
   修复「HOME 后左右移动，夹爪向下掉」+ 把 web_ee 姿态控制做对。经用户两轮纠正后定稿为：
   4-DoF IK（位置 + 自动保持俯仰）+ 单独 Roll + 夹爪；面板不再有 Yaw/Pitch 按钮。
 

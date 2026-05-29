@@ -163,9 +163,12 @@ lerobot-eval \
   3. 真机：用户手上的 SO-100 follower 跑 `sh teleop.sh`，方向键/Shift_L/R/Ctrl_L/R 能驱动 EE。
 - 状态：completed（1 + 2 已通过；3 需用户手上的真机验证）。
 
-### F12 — web_ee 改为「4-DoF IK（位置 + 自动保持俯仰）+ 单独 Roll + 夹爪」，修复夹爪下垂
-- 目标：修正「HOME 后左右移动夹爪下垂」的问题，并把姿态控制做对：
-  用户面板只保留 ±X/±Y/±Z 位置 + Roll + 夹爪；方位角不再是单电机 jog。
+### F12 — web_ee 双面板：左 = EE 控制(4-DoF IK, demo bad case)，右 = 12 按钮直接关节遥操
+- 目标（最终）：用户认定 SO-100 不适合 EEF 控制，最佳遥操方式是直接控制电机。故 web_ee 做成左右两栏：
+    - 左栏：保留 4-DoF IK 的 EE 控制（±X/±Y/±Z + Roll + 夹爪），作为「demo / bad case」展示 EEF 的不足；
+    - 右栏：12 个按钮（6 电机 × ±）直接关节 jog 控制全部电机（推荐），完全绕过 IK。
+- 演进（前序）：修正「HOME 后左右移动夹爪下垂」并把姿态做对：
+  EE 面板只保留 ±X/±Y/±Z + Roll + 夹爪；方位角不再是单电机 jog（pitch 由 IK 自动保持）。
 - 关键设计（经用户两轮纠正后定稿）：
   - 物理前提：SO-100/101 是 5-DoF 臂，无法跟踪任意 6-DoF EE 朝向；用户明确「物理上不支持欧拉角」。
   - 架构 = **4-DoF + EE**：把 shoulder_pan/shoulder_lift/elbow_flex/wrist_flex 4 个关节交给 IK，
@@ -188,10 +191,21 @@ lerobot-eval \
       保留 `FROZEN_JOINTS=()`（消除未用的 WeightedInverseKinematics NameError 隐患）。
   - `config_so_follower_ee.py`：新增 `hold_pitch_deg: float|None = None`（None=捕获 HOME 仰角）；
     `orientation_step_deg` 注释改为仅 Roll。
+- 直接关节遥操（右栏，新增）：
+  - `teleop_web_ee.py`：新增 `JOINT_MOTORS`(6 电机)；_State / halt 增加 `j_<motor>`(-1/0/+1)；HTML 改为
+    `.cols` 两栏布局（左 EE+badge"demo·bad case"，右 12 按钮+badge"recommended"）；get_action 额外发
+    `joint_<motor>`；action_features 追加 6 键。
+  - `so_follower_ee.py`：`action_features` 追加 `joint_<motor>`；`send_action` 在 home 之后、EE-idle 之前
+    新增「直接关节 jog」分支：任一 `joint_<motor>≠0` 时绕过 IK，按 `joint_jog_step_deg` 在上次目标上累加，
+    gripper 夹到 [0,100]，并 reset EE pipeline（便于之后切回 EE 重新 latch）。
+  - `config_so_follower_ee.py`：新增 `joint_jog_step_deg: float = 2.0`（手臂关节为度；gripper 为 0–100 单位）。
 - 验收：
-  1. teleop import + action_features = {delta_x,delta_y,delta_z,delta_roll,gripper}；UI 有 Roll、无 yaw/pitch 按钮。 ✓
-  2. 完整 pipeline 构建并跑通。 ✓
-  3. 伺服闭环模拟：HOME 仰角 0°；连续 15 次 +Y（EE 实际移动 Y 0→0.272m）后仰角仍 +0.03°（保持、不下垂）；
+  1. teleop import + action_features = {delta_x,delta_y,delta_z,delta_roll,gripper, joint_<6 电机>}；
+     UI 左栏 EE(有 Roll、无 yaw/pitch、badge demo)，右栏 12 个 `data-axis="j_*"` 按钮(badge recommended)。 ✓
+  2. 完整 EE pipeline 构建并跑通。 ✓
+  3. EE 伺服闭环模拟：HOME 仰角 0°；连续 15 次 +Y（EE 实际移动 Y 0→0.272m）后仰角仍 +0.03°（保持、不下垂）；
      连续 5 次 roll → wrist_roll 0→10°、仰角不变。 ✓
-  4. 真机：用户用 web 面板验证 X/Y/Z 移动夹爪不再下垂；Roll 正常。
-- 状态：completed（1/2/3 已通过；4 需真机验证）。
+  4. 直接关节 jog 单元（stub bus）：单电机连续按住正确累加(elbow 0→2→…→10 @2°/tick)、其余电机保持、
+     gripper 夹到 100 封顶。 ✓
+  5. 真机：用户用右栏 12 按钮逐电机验证方向/范围；左栏 EE 作为对照 demo。
+- 状态：completed（1–4 离线通过；5 需真机验证）。

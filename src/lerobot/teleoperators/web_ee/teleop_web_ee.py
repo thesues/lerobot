@@ -27,6 +27,17 @@ from .configuration_web_ee import WebEndEffectorTeleopConfig
 
 logger = logging.getLogger(__name__)
 
+# Motors of the SO-100/101 follower, in bus order. The right-side "Joint control"
+# panel exposes a ±jog button per motor (``j_<motor>`` axis → ``joint_<motor>`` action).
+JOINT_MOTORS: tuple[str, ...] = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+)
+
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -58,46 +69,85 @@ _INDEX_HTML = """<!doctype html>
   section { margin-top: 14px; }
   .status { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px;
             opacity: 0.6; margin-top: 14px; white-space: pre; }
-  .legend { font-size: 11px; opacity: 0.55; margin-top: 6px; }
+  .legend { font-size: 11px; opacity: 0.55; margin-top: 6px; max-width: 720px; }
+  .cols { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start; }
+  .col { flex: 0 0 auto; }
+  .badge { font-size: 10px; padding: 2px 6px; border-radius: 6px; vertical-align: middle;
+           background: rgba(220,50,50,0.18); color: #dc3232; font-weight: 600; }
+  .badge.good { background: rgba(60,160,90,0.18); color: #3ca05a; }
 </style>
 </head>
 <body>
-<h1>SO-100 EE Teleop</h1>
+<h1>SO-100 Teleop</h1>
 
-<div class="grid pad">
-  <button class="empty"></button>
-  <button data-axis="dx" data-val="1" title="+X (forward, away from base)">↑</button>
-  <button class="empty"></button>
-  <button data-axis="dy" data-val="1" title="+Y (arm's left)">←</button>
-  <button class="stop" data-halt>STOP</button>
-  <button data-axis="dy" data-val="-1" title="−Y (arm's right)">→</button>
-  <button class="empty"></button>
-  <button data-axis="dx" data-val="-1" title="−X (backward, toward base)">↓</button>
-  <button class="empty"></button>
+<div class="cols">
+
+  <div class="col">
+    <h1>EE control · 4-DoF IK <span class="badge">demo · bad case</span></h1>
+    <div class="grid pad">
+      <button class="empty"></button>
+      <button data-axis="dx" data-val="1" title="+X (forward, away from base)">↑</button>
+      <button class="empty"></button>
+      <button data-axis="dy" data-val="1" title="+Y (arm's left)">←</button>
+      <button class="stop" data-halt>STOP</button>
+      <button data-axis="dy" data-val="-1" title="−Y (arm's right)">→</button>
+      <button class="empty"></button>
+      <button data-axis="dx" data-val="-1" title="−X (backward, toward base)">↓</button>
+      <button class="empty"></button>
+    </div>
+    <section class="grid row">
+      <button data-axis="dz" data-val="1" class="wide">Z+ (raise)</button>
+      <button data-axis="dz" data-val="-1" class="wide">Z− (lower)</button>
+    </section>
+    <section class="grid row">
+      <button data-axis="roll" data-val="1" class="wide" title="wrist_roll + : spin gripper CCW">Roll ↺</button>
+      <button data-axis="roll" data-val="-1" class="wide" title="wrist_roll − : spin gripper CW">Roll ↻</button>
+    </section>
+    <section class="grid row" id="gripper-row">
+      <button data-axis="gripper" data-val="2" class="wide">Open ✋</button>
+      <button data-axis="gripper" data-val="0" class="wide">Close ✊</button>
+    </section>
+  </div>
+
+  <div class="col">
+    <h1>Joint control · all 6 motors <span class="badge good">recommended</span></h1>
+    <section class="grid row">
+      <button data-axis="j_shoulder_pan" data-val="-1" class="wide">J1 Pan −</button>
+      <button data-axis="j_shoulder_pan" data-val="1" class="wide">J1 Pan +</button>
+    </section>
+    <section class="grid row">
+      <button data-axis="j_shoulder_lift" data-val="-1" class="wide">J2 Lift −</button>
+      <button data-axis="j_shoulder_lift" data-val="1" class="wide">J2 Lift +</button>
+    </section>
+    <section class="grid row">
+      <button data-axis="j_elbow_flex" data-val="-1" class="wide">J3 Elbow −</button>
+      <button data-axis="j_elbow_flex" data-val="1" class="wide">J3 Elbow +</button>
+    </section>
+    <section class="grid row">
+      <button data-axis="j_wrist_flex" data-val="-1" class="wide">J4 W.Flex −</button>
+      <button data-axis="j_wrist_flex" data-val="1" class="wide">J4 W.Flex +</button>
+    </section>
+    <section class="grid row">
+      <button data-axis="j_wrist_roll" data-val="-1" class="wide">J5 W.Roll −</button>
+      <button data-axis="j_wrist_roll" data-val="1" class="wide">J5 W.Roll +</button>
+    </section>
+    <section class="grid row">
+      <button data-axis="j_gripper" data-val="-1" class="wide">J6 Grip −</button>
+      <button data-axis="j_gripper" data-val="1" class="wide">J6 Grip +</button>
+    </section>
+  </div>
+
 </div>
 
-<section class="grid row">
-  <button data-axis="dz" data-val="1" class="wide">Z+ (raise)</button>
-  <button data-axis="dz" data-val="-1" class="wide">Z− (lower)</button>
-</section>
-
-<section class="grid row">
-  <button data-axis="roll" data-val="1" class="wide" title="wrist_roll + : spin gripper CCW">Roll ↺</button>
-  <button data-axis="roll" data-val="-1" class="wide" title="wrist_roll − : spin gripper CW">Roll ↻</button>
-</section>
-
-<section class="grid row" id="gripper-row">
-  <button data-axis="gripper" data-val="2" class="wide">Open ✋</button>
-  <button data-axis="gripper" data-val="0" class="wide">Close ✊</button>
-</section>
-
 <section class="grid">
-  <button class="home wide" id="home-btn">HOME (reset to neutral)</button>
+  <button class="home wide" id="home-btn">HOME (reset all motors to neutral)</button>
 </section>
 
 <div class="status" id="status">dx=0 dy=0 dz=0 roll=0 gripper=1</div>
-<div class="legend">Position (URDF frame, top-down): ↑/↓ = ±X (forward/back), ←/→ = ±Y (arm's left/right), Z± = up/down.
-The arm is solved by 4-DoF IK to that X/Y/Z target while automatically holding the gripper pitch level, so it no longer droops (azimuth follows X/Y; no separate yaw/pitch). Roll = wrist_roll (spin about the gripper axis). Hold a button to keep moving. STOP releases all axes. HOME snaps the arm to its calibrated middle.</div>
+<div class="legend"><b>Left — EE control (4-DoF IK), kept as a demo of why EE control is a poor fit for this 5-DoF arm.</b>
+↑/↓ = ±X, ←/→ = ±Y, Z± = up/down; the IK auto-holds the gripper pitch level (no droop); Roll = wrist_roll.
+<b>Right — direct joint jog of all 6 motors (recommended).</b> Each ± nudges one motor; bypasses IK entirely.
+Hold any button to keep moving. STOP releases all axes. HOME snaps every motor to its calibrated middle.</div>
 
 <script>
 const status = document.getElementById('status');
@@ -162,9 +212,9 @@ class _State:
     def __init__(self, use_gripper: bool):
         self._lock = threading.Lock()
         self._use_gripper = use_gripper
-        # dx/dy/dz and roll are -1/0/+1 ; gripper is 0/1/2 (close/stay/open) matching
-        # keyboard_ee. roll is a per-tick wrist_roll jog direction; EE yaw/pitch are
-        # handled by the robot's 4-DoF IK (yaw implicit in X/Y, pitch auto-held).
+        # EE-control panel (left): dx/dy/dz and roll are -1/0/+1 ; gripper is 0/1/2
+        # (close/stay/open) matching keyboard_ee. Joint panel (right): j_<motor> are
+        # -1/0/+1 per-motor jog directions that bypass IK on the robot side.
         self._state: dict[str, int] = {
             "dx": 0,
             "dy": 0,
@@ -172,6 +222,7 @@ class _State:
             "roll": 0,
             "gripper": 1,
         }
+        self._state.update({f"j_{m}": 0 for m in JOINT_MOTORS})
         # One-shot flag — set by /home, cleared the next time get_action() snapshots it.
         self._home_request: bool = False
 
@@ -209,6 +260,7 @@ class _State:
     def halt(self) -> dict[str, int]:
         with self._lock:
             self._state = {"dx": 0, "dy": 0, "dz": 0, "roll": 0, "gripper": 1}
+            self._state.update({f"j_{m}": 0 for m in JOINT_MOTORS})
             return dict(self._state)
 
     def snapshot(self) -> dict[str, int]:
@@ -298,6 +350,8 @@ class WebEndEffectorTeleop(Teleoperator):
         }
         if self.config.use_gripper:
             keys["gripper"] = len(keys)
+        for motor in JOINT_MOTORS:
+            keys[f"joint_{motor}"] = len(keys)
         return {
             "dtype": "float32",
             "shape": (len(keys),),
@@ -358,6 +412,9 @@ class WebEndEffectorTeleop(Teleoperator):
         }
         if self.config.use_gripper:
             action["gripper"] = float(snap["gripper"])
+        # Direct per-motor jog (right panel) — bypasses IK on the robot side.
+        for motor in JOINT_MOTORS:
+            action[f"joint_{motor}"] = float(snap[f"j_{motor}"])
         return action
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:
