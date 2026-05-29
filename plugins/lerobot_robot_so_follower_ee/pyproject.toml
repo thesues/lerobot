@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Shim distribution: exists solely so that lerobot's `register_third_party_plugins()`
+# (which scans installed dists with `lerobot_robot_/camera_/teleoperator_/policy_`
+# prefixes) finds and imports it on startup. The real implementation lives at
+# `src/lerobot/robots/so_follower_ee/` as an additive in-tree module.
+name = "lerobot_robot_so_follower_ee"
+version = "0.1.0"
+description = "Auto-discovery shim that registers the in-tree so_follower_ee robot type with lerobot."
+requires-python = ">=3.10"
+dependencies = [
+    # placo provides the kinematics solver (FK/IK). On macOS the prebuilt placo wheel
+    # was built against urdfdom v4 / tinyxml2 v10, so the cmeel pins below must match.
+    "placo>=0.9.6,<0.9.17",
+    "cmeel-urdfdom<5",
+    "cmeel-tinyxml2<11",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lerobot_robot_so_follower_ee*"]

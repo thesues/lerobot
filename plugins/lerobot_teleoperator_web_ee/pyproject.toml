@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Shim distribution: exists so that lerobot's `register_third_party_plugins()`
+# (which scans installed dists with `lerobot_robot_/camera_/teleoperator_/policy_`
+# prefixes) discovers and imports it on startup. The real implementation lives
+# in-tree at `src/lerobot/teleoperators/web_ee/`.
+name = "lerobot_teleoperator_web_ee"
+version = "0.1.0"
+description = "Auto-discovery shim that registers the in-tree web_ee teleoperator with lerobot."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lerobot_teleoperator_web_ee*"]

@@ -1,3 +1,92 @@
+Date: 2026-05-29
+TaskStatus: completed
+
+Task scope (F12):
+  修复「HOME 后左右移动，夹爪向下掉」+ 把 web_ee 姿态控制做对。经用户两轮纠正后定稿为：
+  4-DoF IK（位置 + 自动保持俯仰）+ 单独 Roll + 夹爪；面板不再有 Yaw/Pitch 按钮。
+
+Current summary (F12):
+  - 设计演进（重要，避免回退）：
+    (a) 最初实现「6 个方位角按钮 = 3 旋转关节直接 jog（yaw→pan, pitch→wrist_flex, roll→wrist_roll）」。
+    (b) 用户纠正①「物理上不支持欧拉角」→ 否掉 EE-frame 6-DoF orientation IK。
+    (c) 用户纠正②「pitch 用 shoulder_lift/elbow 补偿位置做成完全 IK；roll+gripper 单纯；
+        其实是 4DoF+EE；你写的 yaw 和 pitch 按钮不该出现在 web_ee」。
+    (d) 用户最终选择「No pitch button (auto-level)」：pitch 也不做按钮，由 IK 自动把夹爪保持水平。
+  - 定稿架构 = 4-DoF + EE：shoulder_pan/lift/elbow/wrist_flex 交给 IK 解 4 维任务 (x,y,z,仰角)。
+    任务维=关节数=4 → 方阵、唯一解、不抖。Yaw 隐含在 X/Y（IK 自动选 pan），Pitch 由 IK 自动保持
+    HOME 水平仰角（仰角=asin((R·local+Z)_z)，对 azimuth 不变）。Roll(wrist_roll)+gripper 是单纯单关节。
+  - 「夹爪下垂」根因 = 旧 position-only IK(3 关节) 把 wrist_flex 锁在观测值、不补偿姿态。
+    新 IK 把 wrist_flex 纳入并保持仰角 → 移动时不再下垂（已模拟验证）。
+  - 改动文件（全部 additive，零改 lerobot 上游已跟踪文件）：
+      teleop_web_ee.py（_State={dx,dy,dz,roll,gripper}；HTML 去 Yaw/Pitch、留 Roll；get_action/features 同步）
+      so_follower_ee.py（IK_FREE_JOINTS 改 4 关节；DampedJacobianIK→PositionPitchHoldIK（位置+仰角阻尼最小二乘）；
+                         KeyboardDeltaToEECmd 仅透传 delta_roll→jog_roll；OrientationJointJog 仅 roll→wrist_roll；
+                         ORIENTATION_JOG_JOINTS 缩为 roll；action_features/is_idle 仅 delta_roll；
+                         新增 EE_POINTING_AXIS_LOCAL；保留 FROZEN_JOINTS=()）
+      config_so_follower_ee.py（新增 hold_pitch_deg:float|None=None；orientation_step_deg 注释改为仅 Roll）
+  - 验证（venv 离线全通过）：
+      teleop import/features ✓（UI 有 Roll、无 yaw/pitch）；pipeline 构建 ✓；
+      伺服闭环模拟：HOME 仰角 0°→连续 15×+Y（EE 实际 Y 0→0.272m）后仰角仍 +0.03°（保持不垂）；
+      5×roll → wrist_roll 0→10°、仰角不变。 ✓
+  - 待真机验证：用户跑 web 面板，确认 X/Y/Z 移动夹爪不再下垂、Roll 正常。
+
+F12 状态: completed（离线全通过；真机待用户验证）
+
+Main gaps（不阻塞）：
+  - hold_pitch 默认捕获 HOME 仰角(~0°，夹爪水平前指)；如需保持「朝下」等其他角度，
+    设 config.hold_pitch_deg 即可（无需改码）。
+  - Roll 方向符号依赖 URDF；真机若反向翻 web 按钮 data-val。
+  - EE_POINTING_AXIS_LOCAL=(0,0,1) 来自 bundled URDF (so101_new_calib) 的实测；换 URDF 需复核指向轴。
+
+---
+
+Date: 2026-05-27
+TaskStatus: completed
+
+Task scope (F11):
+  让 `lerobot-teleoperate` 在仅有一个 SO-100 follower（无 leader）时通过键盘做 EE 增量控制。
+  目标命令：
+    lerobot-teleoperate \
+      --robot.type=so100_follower_ee \
+      --robot.port=/dev/tty.usbmodem5AE60583301 \
+      --robot.id=my_awesome_follower_arm \
+      --teleop.type=keyboard_ee \
+      --display_data=false
+
+Current summary (F11):
+  - 复用 lerobot 上游 KeyboardEndEffectorTeleop + robot_kinematic_processor 的 EE→IK 步骤；
+    新增 KeyboardDeltaToEECmd bridge（delta_x/y/z/gripper → enabled/target_x/y/z/wx/wy/wz/gripper_vel）。
+  - 注册 robot 类型 so100_follower_ee / so101_follower_ee，内部包一个 SOFollower；
+    send_action 拿当前 obs 跑 IK pipeline，结果转发给底层 bus。
+  - placo on macOS 修复：pyproject 钉 cmeel-urdfdom<5 + cmeel-tinyxml2<11 匹配 placo 的 dylib SONAME。
+  - 离线 smoke 通过：方向键 ↑ 一次得到 shoulder_lift +10°, elbow_flex −12°（合理的 -Y 末端运动）；
+    gripper 离散值 0/1/2 经 GripperVelocityToJoint 正确变 gripper.pos。
+  - 命名约定：config 类必须是 `<X>Config`，`make_device_from_device_class` 取 `<X>` 作为 device 类名
+    （strip "Config"，不保留 "Robot"）。所以 config 命名为 `SOFollowerEndEffectorConfig`，
+    类是 `SOFollowerEndEffector`；保留了 `SOFollowerEndEffectorRobotConfig` 旧别名以兼容。
+  - URDF 来源：本机 /Users/dongmao.zhang/upstream/ManiSkill/mani_skill/assets/robots/so100/so100.urdf
+    （Fixed_Jaw_tip 作为 EE 帧，5 关节链 + gripper 旁路；可通过 --robot.urdf_path 覆盖）。
+
+架构 (零改 lerobot 已跟踪文件)：
+  - 新增 in-tree：src/lerobot/robots/so_follower_ee/
+      config_so_follower_ee.py  (注册 so100_follower_ee / so101_follower_ee)
+      so_follower_ee.py         (SOFollowerEndEffector + KeyboardDeltaToEECmd bridge)
+      __init__.py
+  - 新增 shim dist：plugins/lerobot_robot_so_follower_ee/
+      声明 placo / cmeel-urdfdom<5 / cmeel-tinyxml2<11 依赖；__init__.py 触发上面模块 import。
+  - teleop.sh 切到 so100_follower_ee + keyboard_ee。
+
+F11 状态: completed
+  - lerobot-teleoperate --help 的 --robot.type 列表已含 so100_follower_ee / so101_follower_ee。
+  - 离线 pipeline smoke 通过（详见上）。
+  - 真机验证待用户手上的 SO-100 follower 跑 `sh teleop.sh`（方向键/Shift_L_R/Ctrl_L_R 控制 EE）。
+
+Main gaps（不阻塞）：
+  - URDF 默认路径写死本机 ManiSkill clone；非本机环境需 --robot.urdf_path 覆盖。
+  - placo 仅 macOS 经过验证（cmeel pin 是 macOS 特定的 dylib 版本问题，Linux 上不需要这些 pin）。
+
+---
+
 Date: 2026-05-22
 TaskStatus: completed
 

@@ -133,3 +133,65 @@ lerobot-eval \
   确保人工手动验证步骤始终可执行（对应 CLAUDE.md README 维护要求）。
 - 验收：按文档步骤可从零跑通 F9 的本地冒烟。
 - 状态：completed（`vllm_groot_plugin/README.md` + `scripts/generate_policy_dir.py`）
+
+### F11 — 单 follower 键盘 EE 遥操（独立插件 `lerobot_robot_so_follower_ee`，零改 lerobot）
+- 目标：让 `lerobot-teleoperate --robot.type=so100_follower_ee --teleop.type=keyboard_ee`
+  在仅有一个 SO-100 follower（无 leader）时通过键盘做 end-effector 增量控制。
+- 边界：复用 lerobot 上游的 `KeyboardEndEffectorTeleop` 与 `robot_kinematic_processor` 的 5 个步骤
+  （`EEReferenceAndDelta` / `EEBoundsAndSafety` / `GripperVelocityToJoint` /
+  `InverseKinematicsEEToJoints`，加自写的 `KeyboardDeltaToEECmd` bridge）。
+  IK 用 `RobotKinematics`(placo) + 本地 ManiSkill 的 SO-100 URDF
+  (`/Users/dongmao.zhang/upstream/ManiSkill/mani_skill/assets/robots/so100/so100.urdf`,
+  target frame `Fixed_Jaw_tip`, joints `shoulder_pan/shoulder_lift/elbow_flex/wrist_flex/wrist_roll`)。
+  实现：额外的「end-effector follower」robot 类型注册为 `so100_follower_ee` / `so101_follower_ee`，
+  内部包一个 `SOFollower`；`send_action` 拿当前 obs + EE delta 跑 IK pipeline，得到 6 维 `.pos`
+  后转发给底层 bus。
+- 架构（零改 lerobot 已跟踪文件）：
+  - `src/lerobot/robots/so_follower_ee/` (additive)：`config_so_follower_ee.py`(注册
+    `so100_follower_ee`/`so101_follower_ee`) + `so_follower_ee.py`(`SOFollowerEndEffector` +
+    `KeyboardDeltaToEECmd`) + `__init__.py`。
+  - `plugins/lerobot_robot_so_follower_ee/`：5 行 shim dist；唯一带 `lerobot_robot_` 前缀的存在，
+    `register_third_party_plugins()` 在 `lerobot-teleoperate main()` 里自动 import 触发 draccus 注册。
+- placo 安装修复（macOS）：prebuilt placo wheel 链接的是 urdfdom v4 / tinyxml2 v10，
+  而 cmeel 默认拉 v6 / v11，dlopen 找不到 `liburdfdom_sensor.4.0.dylib` / `libtinyxml2.10.dylib`。
+  pyproject 把 `cmeel-urdfdom<5` + `cmeel-tinyxml2<11` 钉到 v4/v10 即可。
+- 验收：
+  1. `lerobot-teleoperate --help` 的 `--robot.type` 选项中出现 `so100_follower_ee` / `so101_follower_ee`。
+  2. 离线 smoke：构造 `SOFollowerEndEffectorRobotConfig` + `SOFollowerEndEffector`，build pipeline，
+     喂 6 维 fake joint obs (全 0) 与 `{delta_x:0, delta_y:-1, delta_z:0, gripper:1}`，IK 返回的
+     5 维 `.pos` 非零且 `gripper.pos` 保留 = 50；再喂 `gripper:0`，joint 锁住 + `gripper.pos`=0。
+  3. 真机：用户手上的 SO-100 follower 跑 `sh teleop.sh`，方向键/Shift_L/R/Ctrl_L/R 能驱动 EE。
+- 状态：completed（1 + 2 已通过；3 需用户手上的真机验证）。
+
+### F12 — web_ee 改为「4-DoF IK（位置 + 自动保持俯仰）+ 单独 Roll + 夹爪」，修复夹爪下垂
+- 目标：修正「HOME 后左右移动夹爪下垂」的问题，并把姿态控制做对：
+  用户面板只保留 ±X/±Y/±Z 位置 + Roll + 夹爪；方位角不再是单电机 jog。
+- 关键设计（经用户两轮纠正后定稿）：
+  - 物理前提：SO-100/101 是 5-DoF 臂，无法跟踪任意 6-DoF EE 朝向；用户明确「物理上不支持欧拉角」。
+  - 架构 = **4-DoF + EE**：把 shoulder_pan/shoulder_lift/elbow_flex/wrist_flex 4 个关节交给 IK，
+    解一个 4 维末端任务 (x, y, z, 仰角 pitch)。任务维=关节数=4 → 任务 Jacobian 方阵、解唯一、不抖。
+    - Yaw（方位角）**不是按钮**：azimuth 隐含在 X/Y 位置目标里（IK 自动选 shoulder_pan）。
+    - Pitch **不是按钮**：IK 自动把夹爪仰角**保持在 HOME 水平值**（仰角 = asin((R·指向轴)_z)，
+      指向轴 = 夹爪 local +Z；该仰角对 azimuth 不变，因 shoulder_pan 绕世界 Z 转不改 z 分量）。
+      => 臂移动时夹爪不再下垂（根因：旧的 position-only IK 把 wrist_flex 锁死在观测值、不补偿姿态）。
+  - Roll（wrist_roll）+ 夹爪是**单纯的单关节控制**：Roll 仍是每 tick jog `orientation_step_deg`(默认 2°)，
+    绕指向轴自转不改仰角，故不扰动 pitch hold。
+- 架构（零改 lerobot 已跟踪文件，仅改本任务自带的 additive 文件）：
+  - `teleop_web_ee.py`：_State = {dx,dy,dz,roll,gripper}（去掉 pitch/yaw）；HTML 去掉 Yaw/Pitch 按钮、
+    只留 Roll；get_action 发 `delta_x/y/z/roll`；action_features 同步；状态/legend 更新。
+  - `so_follower_ee.py`：
+    - `IK_FREE_JOINTS` 改为 4 关节；新增 `EE_POINTING_AXIS_LOCAL=(0,0,1)`、`hold_pitch` 逻辑。
+    - `DampedJacobianIK`(3 关节 position-only) 重写为 `PositionPitchHoldIK`(4 关节, 位置+仰角阻尼最小二乘,
+      `J_task`=3 行位置 Jacobian + 1 行仰角 Jacobian, `dq=Jᵀ(JJᵀ+λ²I)⁻¹e`; reset() 后从首帧观测捕获 hold 仰角)。
+    - `KeyboardDeltaToEECmd` 只透传 `delta_roll→jog_roll`；`OrientationJointJog` 只处理 roll→wrist_roll。
+    - `ORIENTATION_JOG_JOINTS={"delta_roll":"wrist_roll"}`；`action_features`/`is_idle` 同步（仅 delta_roll）；
+      保留 `FROZEN_JOINTS=()`（消除未用的 WeightedInverseKinematics NameError 隐患）。
+  - `config_so_follower_ee.py`：新增 `hold_pitch_deg: float|None = None`（None=捕获 HOME 仰角）；
+    `orientation_step_deg` 注释改为仅 Roll。
+- 验收：
+  1. teleop import + action_features = {delta_x,delta_y,delta_z,delta_roll,gripper}；UI 有 Roll、无 yaw/pitch 按钮。 ✓
+  2. 完整 pipeline 构建并跑通。 ✓
+  3. 伺服闭环模拟：HOME 仰角 0°；连续 15 次 +Y（EE 实际移动 Y 0→0.272m）后仰角仍 +0.03°（保持、不下垂）；
+     连续 5 次 roll → wrist_roll 0→10°、仰角不变。 ✓
+  4. 真机：用户用 web 面板验证 X/Y/Z 移动夹爪不再下垂；Roll 正常。
+- 状态：completed（1/2/3 已通过；4 需真机验证）。
