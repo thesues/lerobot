@@ -103,8 +103,10 @@ from lerobot.teleoperators import (  # noqa: F401
     rebot_102_leader,
     so_leader,
     unitree_g1,
+    web_so100,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.robot_cameras import revive_dead_cameras
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
@@ -158,6 +160,7 @@ def teleop_loop(
 
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
+    last_obs = None
     while True:
         loop_start = time.perf_counter()
 
@@ -165,7 +168,22 @@ def teleop_loop(
         # Not really needed for now other than for visualization
         # teleop_action_processor can take None as an observation
         # given that it is the identity processor as default
-        obs = robot.get_observation()
+        try:
+            obs = robot.get_observation()
+            last_obs = obs
+        except (TimeoutError, RuntimeError) as e:
+            # A flaky USB camera can stall or kill its read thread, which would
+            # otherwise crash the whole teleop. Reuse the last observation and try
+            # to revive the camera instead of bringing the session down.
+            logging.warning(f"get_observation failed ({e}); reusing last observation")
+            obs = last_obs
+            revive_dead_cameras(robot)
+        except ConnectionError as e:
+            # Transient motor-bus hiccup (e.g. a single dropped status packet over
+            # a flaky USB link). Don't end the session over one glitch — reuse the
+            # last observation; the teleop's targets don't depend on it.
+            logging.warning(f"get_observation motor read failed ({e}); reusing last observation")
+            obs = last_obs
 
         if robot.name == "unitree_g1":
             teleop.send_feedback(obs)
@@ -180,7 +198,12 @@ def teleop_loop(
         robot_action_to_send = robot_action_processor((teleop_action, obs))
 
         # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
-        _ = robot.send_action(robot_action_to_send)
+        try:
+            _ = robot.send_action(robot_action_to_send)
+        except ConnectionError as e:
+            # Transient motor-bus write hiccup — skip this tick rather than crash;
+            # the arm holds its last commanded target until the link recovers.
+            logging.warning(f"send_action failed ({e}); skipping this tick")
 
         if display_data:
             # Process robot observation through pipeline
@@ -227,6 +250,11 @@ def teleoperate(cfg: TeleoperateConfig):
 
     teleop.connect()
     robot.connect()
+
+    # The joint-only web panel seeds its targets from the robot's current pose and
+    # reads the robot's cameras for its live view (it never modifies the robot).
+    if getattr(teleop, "name", None) == "web_so100" and hasattr(teleop, "attach_robot"):
+        teleop.attach_robot(robot)
 
     try:
         teleop_loop(
