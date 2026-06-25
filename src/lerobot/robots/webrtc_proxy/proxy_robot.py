@@ -70,6 +70,10 @@ class _ProxyEndpoint:
         transport_backend: str = "aiortc",
         livekit_url: str | None = None,
         livekit_token: str | None = None,
+        ws_url: str | None = None,
+        ws_session: str | None = None,
+        ws_token: str | None = None,
+        ws_codec: str = "jpeg",  # must match the publisher
         transport: Transport | None = None,
     ) -> None:
         self.buffer = buffer
@@ -86,6 +90,10 @@ class _ProxyEndpoint:
             ice_servers=ice_servers,
             livekit_url=livekit_url,
             livekit_token=livekit_token,
+            ws_url=ws_url,
+            ws_session=ws_session,
+            ws_token=ws_token,
+            ws_codec=ws_codec,
         )
         self.connected = self._transport.connected
         self._transport.channel(CH_STATE).on_message(self._on_state)
@@ -207,12 +215,14 @@ class WebRTCProxyRobot(Robot):
     def connect(self, calibrate: bool = True) -> None:
         if self._connected:
             raise RuntimeError("WebRTCProxyRobot already connected")
-        # aiortc reaches the daemon over our WS signaling relay; livekit signals itself.
-        if self.config.transport_backend == "aiortc" and (
+        # aiortc reaches the daemon over our WS signaling relay; ws dials the data daemon;
+        # both need a ws:// url. livekit signals itself.
+        if self.config.transport_backend in ("aiortc", "ws") and (
             not self.config.signaling_url or not self.config.signaling_url.startswith("ws")
         ):
             raise ValueError(
-                "WebRTCProxyRobot (aiortc) needs a WebSocket signaling_url (ws://host:port/ws)"
+                f"WebRTCProxyRobot ({self.config.transport_backend}) needs a WebSocket "
+                "signaling_url (ws://host:port/ws)"
             )
 
         self._loop = _EventLoopThread()
@@ -229,9 +239,13 @@ class WebRTCProxyRobot(Robot):
                 transport_backend=self.config.transport_backend,
                 livekit_url=self.config.livekit_url,
                 livekit_token=self.config.livekit_token,
+                ws_url=self.config.signaling_url,  # ws backend dials the data daemon here
+                ws_session=self.config.session_id,
+                ws_token=self.config.signaling_token,
+                ws_codec=self.config.ws_codec,
             )
-            # aiortc reaches the daemon over our WS signaling relay; livekit signals itself
-            # (the transport ignores the signaling arg).
+            # aiortc reaches the daemon over our WS signaling relay; ws/livekit signal
+            # themselves (the transport ignores the signaling arg, so leave _ws_sig None).
             if self.config.transport_backend == "aiortc":
                 self._ws_sig = WebSocketSignaling(
                     self.config.signaling_url,

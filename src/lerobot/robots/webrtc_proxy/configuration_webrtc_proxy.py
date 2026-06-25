@@ -81,9 +81,14 @@ class WebRTCProxyRobotConfig(RobotConfig):
     # ICE servers for the controller's peer connection. Empty => host candidates only
     # (loopback / same-host two-process). M4 injects STUN/TURN for real public-net peers.
     ice_servers: list[str] = field(default_factory=list)
-    # Transport backend: "aiortc" (default, self-contained P2P) | "livekit" (SFU; both
-    # the controller and the Mac daemon must use the same backend).
+    # Transport backend (both ends must match): "aiortc" (default, self-contained P2P) |
+    # "livekit" (SFU relay) | "ws" (media + control relayed through ws_server_daemon at
+    # signaling_url — the option that works when both peers are behind symmetric NAT).
     transport_backend: str = "aiortc"
+    # ws backend video codec (both ends must match): "jpeg" (intra-frame, default) |
+    # "h264" (inter-frame via PyAV; ~3-10x less bandwidth). ws_bitrate is the h264 target.
+    ws_codec: str = "jpeg"
+    ws_bitrate: int = 2_000_000
     # Required when transport_backend == "livekit": the LiveKit server URL + a JWT.
     livekit_url: str | None = None
     livekit_token: str | None = None

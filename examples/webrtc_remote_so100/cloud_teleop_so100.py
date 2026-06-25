@@ -166,9 +166,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cloud-side teleop for a remote SO-100 over WebRTC")
     parser.add_argument("--mode", choices=["web", "console"], default="web")
     parser.add_argument(
-        "--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend"
+        "--transport", choices=["aiortc", "livekit", "ws"], default="aiortc", help="transport backend"
     )
-    parser.add_argument("--signaling-url", default=SIGNALING_URL, help="WS relay URL (aiortc)")
+    parser.add_argument(
+        "--signaling-url", default=SIGNALING_URL, help="WS url: signaling relay (aiortc) or data daemon (ws)"
+    )
+    parser.add_argument(
+        "--ws-codec",
+        choices=["jpeg", "h264"],
+        default="jpeg",
+        help="ws backend video codec (must match the daemon's --ws-codec)",
+    )
     parser.add_argument(
         "--auth-token",
         default=os.environ.get("SIGNALING_AUTH_TOKEN"),
@@ -221,6 +229,7 @@ def main() -> None:
             transport_backend=args.transport,
             livekit_url=args.livekit_url,
             livekit_token=livekit_token,
+            ws_codec=args.ws_codec,
         )
     )
     robot.connect()

@@ -146,6 +146,29 @@
 > M4 仍剩真活:K8s 媒体面(hostNetwork / announced IP)、relay 多租户路由+鉴权,本机不可测。详见 DESIGN §11.1。
 > （演变:v1"不做 TURN" → v2"加 coturn" → v3"直连用 STUN、中继用 LiveKit、不做 coturn"。）
 
+## M-WS Feature —— `ws` 中转 backend（两端对称 NAT 可用，无 WebRTC）
+
+### F13 — ws 数据面 backend（ws_server_daemon + WsRelayTransport）
+- **目标**：当云 Pod ↔ 家用 Mac **两端都是对称 NAT**、又不想跑 LiveKit 时，提供第三个传输
+  backend `ws`：在 controller 侧起一个专门的数据中枢 `ws_server_daemon.py`，媒体（JPEG 帧，
+  BINARY）+ 控制/状态/动作（TEXT JSON）**全经它中转**；mac_daemon 与 controller 都**主动拨出**
+  连它（落在「一端公网」可穿透情形）。新增 `WsRelayTransport(Transport)` 实现同一接口，
+  `CaptureAgent` / `_ProxyEndpoint` / `WebRTCProxyRobot` 不改；`make_transport` 加 `ws` 分支；
+  两端 `--transport ws` 复用 `signaling_url`（指向 ws daemon）/`session`/`auth-token`。
+  **aiortc（直连）/ livekit（SFU）两条老路径零改动、共存。**
+- **验收**：进程内 daemon+mac+controller over localhost，obs/action 往返、obs seq 持续推进、
+  daemon 跨 session 复用；全量 webrtc_proxy 套件无回归。
+- **状态**：completed（`tests/robots/test_webrtc_proxy_ws.py` jpeg+h264 各 3 = 6 passed；全套 49 passed,1 skip）
+- **设计注记**：daemon 是近乎 dumb 转发器（TEXT 有界缓冲保 hello+早期 control；BINARY 只留最新帧、
+  丢陈旧；断开发 bye）。**双 codec**（两端 `--ws-codec` 必须一致）：
+  - `jpeg`（默认，帧内）：`ws_jpeg_quality` 默认 80，裸帧 900KB→~30-80KB（~10-20Mbps）；每帧独立可解 →
+    writer 只留最新未发帧（丢陈旧）缓解单 socket 视频/控制 HoL。
+  - `h264`（帧间，PyAV/libav）：~3-10× 省带宽（~1-5Mbps）；zerolatency 无 B 帧，publisher 在对端到场后
+    才编码→流首帧必为 IDR，新订阅端首包即可解（无需额外 keyframe 信令）。代价：严格有序包流不能丢单帧 →
+    FIFO 排队，积压超 `_H264_MAX_BACKLOG` 则清空 + 强制下一帧 IDR 重同步。`--ws-bitrate` 调码率，
+    `--ws-hwaccel` 用平台硬编码（macOS `h264_videotoolbox`）。色彩保真已验证（无 R/B 交换）。
+  - 带宽敏感优先 h264 或 aiortc/livekit，别随手降分辨率。
+
 ## 不在 M1 范围（不要回头做）
 - 真实串口/相机（M2）、信令服务/STUN/TURN（M3）、K8s/coturn（M4）、paradigm 落地（M5）。
 - 已否决方案：socat 串口转发、usbip USB 透传、把 record/eval 挪回本地（见 context §6）。

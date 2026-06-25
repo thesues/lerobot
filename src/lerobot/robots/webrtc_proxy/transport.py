@@ -30,8 +30,12 @@ interface without touching ``CaptureAgent`` / ``_ProxyEndpoint`` / ``WebRTCProxy
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
+import struct
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable
 from fractions import Fraction
 
@@ -51,13 +55,25 @@ def make_transport(
     ice_servers: list[str | dict] | None = None,
     livekit_url: str | None = None,
     livekit_token: str | None = None,
+    ws_url: str | None = None,
+    ws_session: str | None = None,
+    ws_token: str | None = None,
+    ws_codec: str = "jpeg",
+    ws_jpeg_quality: int = 80,
+    ws_bitrate: int = 2_000_000,
+    ws_hwaccel: bool = False,
 ) -> "Transport":
-    """Build a transport for ``backend`` ("aiortc" | "livekit").
+    """Build a transport for ``backend`` ("aiortc" | "livekit" | "ws").
 
-    Both ends of a session MUST use the same backend (an aiortc P2P peer and a LiveKit
-    room don't interoperate). "aiortc" is the default, self-contained backend. "livekit"
-    (EXPERIMENTAL scaffold, see ``transport_livekit.py``) routes via a LiveKit SFU and
-    needs ``livekit_url`` + ``livekit_token``.
+    Both ends of a session MUST use the same backend (an aiortc P2P peer, a LiveKit room
+    and a ws-relay peer don't interoperate). "aiortc" is the default, self-contained P2P
+    backend. "livekit" (EXPERIMENTAL scaffold, see ``transport_livekit.py``) routes via a
+    LiveKit SFU and needs ``livekit_url`` + ``livekit_token``. "ws" relays BOTH media and
+    control through a ``ws_server_daemon`` (``ws_url`` + ``ws_session``, optional
+    ``ws_token``) — the direct-style backend that works when both peers are behind
+    symmetric NAT, since each side merely dials OUT to the public daemon (see
+    ``NAT_TRAVERSAL_NOTES.md``). The ws video codec is ``ws_codec`` ("jpeg" intra-frame,
+    default; or "h264" inter-frame via PyAV — both ends must match).
     """
     if backend == "aiortc":
         return AiortcTransport(role=role, channels=channels, ice_servers=ice_servers)
@@ -67,7 +83,21 @@ def make_transport(
         from .transport_livekit import LiveKitTransport
 
         return LiveKitTransport(role=role, channels=channels, url=livekit_url, token=livekit_token)
-    raise ValueError(f"unknown transport backend {backend!r} (expected 'aiortc' or 'livekit')")
+    if backend == "ws":
+        if not ws_url or not ws_session:
+            raise ValueError("transport_backend='ws' requires ws_url and ws_session")
+        return WsRelayTransport(
+            role=role,
+            channels=channels,
+            url=ws_url,
+            session=ws_session,
+            token=ws_token,
+            codec=ws_codec,
+            jpeg_quality=ws_jpeg_quality,
+            bitrate=ws_bitrate,
+            hwaccel=ws_hwaccel,
+        )
+    raise ValueError(f"unknown transport backend {backend!r} (expected 'aiortc', 'livekit' or 'ws')")
 
 
 class Channel(ABC):
@@ -301,3 +331,293 @@ class AiortcTransport(Transport):
     async def close(self) -> None:
         self.closed.set()
         await self.pc.close()
+
+
+# --------------------------------------------------------------------------- #
+# ws backend (media + control relayed through ws_server_daemon)
+# --------------------------------------------------------------------------- #
+# Frame wire format on the BINARY channel: 8-byte big-endian capture seq, then the
+# encoded payload — a whole JPEG ("jpeg" codec, every frame independently decodable) or
+# one H.264 access-unit packet ("h264" codec, inter-frame). JPEG/H.264 both round-trip
+# the RGB array regardless of channel-order labelling, so no BGR/RGB swap is needed.
+_FRAME_SEQ = struct.Struct(">Q")
+
+# When the H.264 send backlog blows past this (a stalled socket), drop the WHOLE backlog
+# and force the next frame to be a keyframe — a partial inter-frame stream is undecodable,
+# so we resync at the next IDR rather than dribble corrupt packets.
+_H264_MAX_BACKLOG = 90
+
+
+class _WsChannel(Channel):
+    """A named pipe over the shared relay WebSocket. Messages ride a ``{"kind":"ch"}``
+    envelope so the one socket multiplexes state/action/control. Best-effort: ``send``
+    drops until the peer handshake completes (``connected``)."""
+
+    def __init__(self, label: str, transport: "WsRelayTransport") -> None:
+        self._label = label
+        self._t = transport
+        self._cb: Callable[[str], None] | None = None
+
+    def send(self, data: str) -> None:
+        if self._t.connected.is_set():
+            self._t._enqueue_text({"kind": "ch", "label": self._label, "data": data})
+
+    def on_message(self, callback: Callable[[str], None]) -> None:
+        self._cb = callback
+
+    def _dispatch(self, data: str) -> None:
+        if self._cb is not None:
+            self._cb(data)
+
+    @property
+    def is_open(self) -> bool:
+        return self._t.connected.is_set()
+
+
+class WsRelayTransport(Transport):
+    """Relay backend: media + control multiplexed over ONE WebSocket to ``ws_server_daemon``.
+
+    Both peers dial OUT to the same public daemon (``role`` -> robot/controller) and the
+    daemon forwards everything between them. Frames go on the BINARY channel (JPEG, drop
+    -oldest = freshest-wins), small JSON on TEXT. Presence is a one-shot ``hello``
+    handshake: receiving the peer's hello sets ``connected`` (the daemon buffers it for a
+    late joiner). When the daemon reports the peer left (``bye``) or the socket drops,
+    ``closed`` fires so the Mac daemon recycles for the next session.
+
+    Video codec (``codec``, both ends must match):
+      - "jpeg" (default): intra-frame, every frame independently decodable. The writer
+        holds only the freshest unsent frame (drop-stale) — simple, but ~10-20 Mbps.
+      - "h264": inter-frame via PyAV (libav). ~3-10x smaller, at the cost of a strict
+        ordered packet stream (can't drop a single frame), so packets queue FIFO and a
+        blown backlog resyncs at the next forced keyframe. The publisher only starts
+        encoding once the peer is present, so the stream always opens on an IDR — a fresh
+        subscriber can decode from the first packet with no extra keyframe signalling.
+
+    Trade-off vs aiortc/livekit: one ordered TCP socket means video and control share
+    head-of-line. Acceptable for the symmetric-NAT case where direct P2P is impossible.
+    """
+
+    def __init__(
+        self,
+        *,
+        role: str,  # "publisher" (robot, sends video) | "subscriber" (controller, recvs video)
+        channels: dict[str, bool],  # label -> reliable (ignored: TCP is always reliable+ordered)
+        url: str,  # ws://host:port/ws of the ws_server_daemon
+        session: str,
+        token: str | None = None,
+        codec: str = "jpeg",  # "jpeg" (intra) | "h264" (inter, PyAV)
+        jpeg_quality: int = 80,
+        bitrate: int = 2_000_000,  # h264 target bitrate (bits/s)
+        hwaccel: bool = False,  # h264 publisher: use the platform hw encoder (e.g. videotoolbox)
+    ) -> None:
+        super().__init__()
+        if role not in ("publisher", "subscriber"):
+            raise ValueError(f"role must be 'publisher' or 'subscriber', got {role!r}")
+        if codec not in ("jpeg", "h264"):
+            raise ValueError(f"ws codec must be 'jpeg' or 'h264', got {codec!r}")
+        self.role = role
+        self._relay_role = "robot" if role == "publisher" else "controller"
+        sep = "&" if "?" in url else "?"
+        self._url = f"{url}{sep}session={session}&role={self._relay_role}"
+        self._token = token
+        self._codec = codec
+        self._jpeg_quality = int(jpeg_quality)
+        self._bitrate = int(bitrate)
+        self._hwaccel = bool(hwaccel)
+        self._channels: dict[str, _WsChannel] = {label: _WsChannel(label, self) for label in channels}
+        self._frame_cb: Callable[[int, np.ndarray], None] | None = None
+        self._client = None
+        self._ws = None
+        self._out_text: list[dict] = []  # pending TEXT envelopes (FIFO)
+        # jpeg: hold only the freshest unsent frame. h264: an ordered FIFO of packets that
+        # must NOT be reordered or partially dropped (inter-frame dependency).
+        self._out_frame: bytes | None = None
+        self._out_packets: deque[bytes] = deque()
+        self._enc = None  # lazy PyAV encoder (publisher, h264)
+        self._enc_wh: tuple[int, int] | None = None
+        self._dec = None  # lazy PyAV decoder (subscriber, h264)
+        self._force_idr = False
+        self._wake = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
+
+    async def open(self, signaling: Signaling | None = None) -> None:
+        # The ws backend does its own signaling over the relay socket; the SDP `signaling`
+        # arg (used by aiortc) is ignored.
+        import aiohttp
+
+        self._client = aiohttp.ClientSession()
+        headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
+        self._ws = await self._client.ws_connect(self._url, headers=headers, max_msg_size=0)
+        # Announce presence so the peer's `connected` fires; the daemon buffers this until
+        # the peer joins. Sent directly (not via a channel) so it is NOT gated on connected.
+        await self._ws.send_str(json.dumps({"kind": "hello", "role": self._relay_role}))
+        self._tasks = [
+            asyncio.ensure_future(self._reader()),
+            asyncio.ensure_future(self._writer()),
+        ]
+
+    def _enqueue_text(self, envelope: dict) -> None:
+        self._out_text.append(envelope)
+        self._wake.set()
+
+    async def _reader(self) -> None:
+        import aiohttp
+
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    self._on_text(msg.data)
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    self._on_frame(msg.data)
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ws transport: reader error")
+        finally:
+            self.closed.set()
+            self._wake.set()  # let the writer notice closure and exit
+
+    def _on_text(self, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            logger.exception("ws transport: bad TEXT message")
+            return
+        kind = data.get("kind")
+        if kind == "hello":
+            self.connected.set()
+        elif kind == "ch":
+            ch = self._channels.get(data.get("label"))
+            if ch is not None:
+                ch._dispatch(data.get("data", ""))
+        elif kind == "bye":
+            self.closed.set()
+            self._wake.set()
+        # ignore anything else
+
+    def _on_frame(self, payload: bytes) -> None:
+        if self._frame_cb is None or len(payload) < _FRAME_SEQ.size:
+            return
+        seq = _FRAME_SEQ.unpack(payload[: _FRAME_SEQ.size])[0]
+        body = payload[_FRAME_SEQ.size :]
+        try:
+            if self._codec == "h264":
+                for img in self._decode_h264(body):
+                    self._frame_cb(seq, img)
+            else:
+                import cv2
+
+                img = cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR)
+                if img is not None:
+                    self._frame_cb(seq, img)
+        except Exception:
+            logger.exception("ws transport: frame decode error")
+
+    async def _writer(self) -> None:
+        try:
+            while not self.closed.is_set():
+                await self._wake.wait()
+                self._wake.clear()
+                # Drain control/state/action first (small, latency-sensitive), then video.
+                while self._out_text and not self.closed.is_set():
+                    await self._ws.send_str(json.dumps(self._out_text.pop(0), separators=(",", ":")))
+                if self._codec == "h264":
+                    # Ordered packet stream — send all in FIFO order, never reorder/drop one.
+                    while self._out_packets and not self.closed.is_set():
+                        await self._ws.send_bytes(self._out_packets.popleft())
+                else:
+                    frame = self._out_frame  # freshest unsent JPEG (older ones overwritten)
+                    if frame is not None and not self.closed.is_set():
+                        self._out_frame = None
+                        await self._ws.send_bytes(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ws transport: writer error")
+            self.closed.set()
+
+    def channel(self, label: str) -> Channel:
+        return self._channels[label]
+
+    def send_frame(self, seq: int, img: np.ndarray) -> None:
+        if not self.connected.is_set():
+            return  # don't stream until the peer is present (avoids relay-side buffering)
+        try:
+            if self._codec == "h264":
+                self._encode_h264(seq, img)
+            else:
+                import cv2
+
+                ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
+                if ok:
+                    self._out_frame = _FRAME_SEQ.pack(seq) + buf.tobytes()  # freshest wins
+                    self._wake.set()
+        except Exception:
+            logger.exception("ws transport: frame encode error")
+
+    # ----- h264 (PyAV / libav) codec ---------------------------------------
+    def _make_encoder(self, width: int, height: int):  # noqa: ANN202 (av.CodecContext)
+        import av
+
+        name = "h264_videotoolbox" if self._hwaccel else "libx264"
+        cc = av.CodecContext.create(name, "w")
+        cc.width = width
+        cc.height = height
+        cc.pix_fmt = "yuv420p"
+        cc.bit_rate = self._bitrate
+        cc.time_base = Fraction(1, VIDEO_CLOCK_RATE)
+        if name == "libx264":
+            # Low-latency teleop: emit each frame immediately, no B-frame reordering.
+            cc.options = {"tune": "zerolatency", "preset": "ultrafast"}
+        return cc
+
+    def _encode_h264(self, seq: int, img: np.ndarray) -> None:
+        import av
+
+        wh = (int(img.shape[1]), int(img.shape[0]))
+        # (Re)create the encoder on first frame, a resolution change, or a forced resync —
+        # a brand-new encoder's first packet is always an IDR keyframe.
+        if self._enc is None or self._enc_wh != wh or self._force_idr:
+            self._enc = self._make_encoder(*wh)
+            self._enc_wh = wh
+            self._force_idr = False
+        frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(img), format="rgb24").reformat(
+            format="yuv420p"
+        )
+        frame.pts = seq * VIDEO_PTS_PER_SEQ
+        frame.time_base = Fraction(1, VIDEO_CLOCK_RATE)
+        for pkt in self._enc.encode(frame):
+            self._out_packets.append(_FRAME_SEQ.pack(seq) + bytes(pkt))
+        if len(self._out_packets) > _H264_MAX_BACKLOG:
+            # Socket can't keep up: a partial inter-frame stream is undecodable, so drop the
+            # whole backlog and resync the decoder at the next IDR (forced on next encode).
+            logger.warning("ws transport: h264 backlog overflow -> drop + resync (IDR)")
+            self._out_packets.clear()
+            self._force_idr = True
+        self._wake.set()
+
+    def _decode_h264(self, body: bytes) -> list[np.ndarray]:
+        import av
+
+        if self._dec is None:
+            self._dec = av.CodecContext.create("h264", "r")
+        # Packets before the first IDR decode to nothing; our stream opens on an IDR.
+        frames = self._dec.decode(av.packet.Packet(body))
+        return [f.to_ndarray(format="rgb24") for f in frames]
+
+    def set_frame_handler(self, callback: Callable[[int, np.ndarray], None]) -> None:
+        self._frame_cb = callback
+
+    async def close(self) -> None:
+        self.closed.set()
+        self._wake.set()
+        for t in self._tasks:
+            t.cancel()
+        if self._ws is not None:
+            with contextlib.suppress(Exception):
+                await self._ws.close()
+        if self._client is not None:
+            with contextlib.suppress(Exception):
+                await self._client.close()

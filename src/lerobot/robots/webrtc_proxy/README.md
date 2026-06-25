@@ -202,6 +202,69 @@ LEROBOT_LIVEKIT_URL=ws://127.0.0.1:7880 \
 
 NAT / restrictive-egress reachability (why SFU, not P2P) is covered in `DESIGN.md` §11.1.1.
 
+## ws backend (relayed, symmetric-NAT-proof, no WebRTC)
+
+When **both** peers sit behind symmetric NAT and you don't want to run LiveKit, the
+`ws` backend relays *everything* — media **and** control — through a single dedicated
+**data daemon** (`ws_server_daemon.py`) instead of a P2P media path. Both peers just
+dial **outward** to that one public daemon (the only topology that always works across
+symmetric NAT — see `NAT_TRAVERSAL_NOTES.md`):
+
+```
+Mac daemon (role=robot) ──ws push state+frames / recv actions──▶  ws_server_daemon  ◀──ws──  controller
+                                                                  (public, ALB/ingress)     (role=controller, local)
+```
+
+Run it on the **controller side** (the public host / cloud Pod), then point both ends at it:
+
+```bash
+# 1) data daemon (controller side; expose its port publicly, e.g. behind an L7 ALB/ingress)
+python -m lerobot.robots.webrtc_proxy.ws_server_daemon --port 8765 --auth-token "$SIGNALING_AUTH_TOKEN"
+
+# 2) Mac daemon (publisher) — dials the daemon's PUBLIC url
+uv run python -m lerobot.robots.webrtc_proxy.mac_daemon --session so100 \
+    --transport ws --signaling-url ws://<public-host>/ws --auth-token "$SIGNALING_AUTH_TOKEN" \
+    --real-camera 0   # drop for synthetic frames
+
+# 3) cloud controller (subscriber) — dials the same daemon (localhost, co-located)
+uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py \
+    --transport ws --signaling-url ws://127.0.0.1:8765/ws --auth-token "$SIGNALING_AUTH_TOKEN"
+```
+
+**Frames are compressed before they hit the socket** (raw 640×480×3 ≈ 900 KB/frame ≈ 216
+Mbps @30fps — far too much). Two codecs, both ends must match via `--ws-codec`:
+
+- **`jpeg`** (default): intra-frame, ≈ 30–80 KB/frame ≈ 10–20 Mbps. Every frame is
+  independently decodable, so the backend keeps only the **freshest unsent frame** (drops
+  stale ones) to bound the video/control head-of-line coupling on the single socket. Tune
+  quality with `WebRTCProxyRobotConfig`/`make_transport(..., ws_jpeg_quality=N)` (default 80).
+- **`h264`** (inter-frame, via **PyAV**/libav): ≈ 3–10× less bandwidth (~1–5 Mbps).
+  Encoded zerolatency (no B-frames) and the publisher only starts once the peer is present,
+  so the stream always opens on an IDR — a fresh subscriber decodes from the first packet.
+  Cost: a strict ordered packet stream (can't drop a single frame), so packets queue FIFO
+  and a blown backlog resyncs at the next forced keyframe. Target bitrate via `--ws-bitrate`;
+  `--ws-hwaccel` uses the platform HW encoder (e.g. `h264_videotoolbox` on macOS).
+
+```bash
+# H.264 example: add --ws-codec h264 to BOTH ends (and optionally --ws-bitrate / --ws-hwaccel)
+uv run python -m lerobot.robots.webrtc_proxy.mac_daemon --session so100 \
+    --transport ws --signaling-url ws://<public-host>/ws --auth-token "$SIGNALING_AUTH_TOKEN" \
+    --ws-codec h264 --ws-bitrate 3000000 --ws-hwaccel --real-camera 0
+uv run python examples/webrtc_remote_so100/cloud_teleop_so100.py \
+    --transport ws --signaling-url ws://127.0.0.1:8765/ws --auth-token "$SIGNALING_AUTH_TOKEN" \
+    --ws-codec h264
+```
+
+Inter-frame coding (`h264`) is what aiortc/livekit give you for free over their own
+transports; the ws backend brings it to the symmetric-NAT relay path. Prefer it over
+dropping resolution when bandwidth is the bottleneck.
+
+The opt-in e2e test runs daemon + mac-daemon + controller in-process over localhost:
+
+```bash
+uv run pytest tests/robots/test_webrtc_proxy_ws.py -p no:hydra_pytest -q
+```
+
 ## Known limitations (M1 — to fix in later milestones)
 
 - **Frame seq rides `pts`, recovered relative to the first received frame.** Robust to

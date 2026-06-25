@@ -83,9 +83,15 @@ class CaptureAgent:
         robot=None,  # a connected lerobot Robot (so_follower) — drives joints+action+torque (M2)
         reliable_state: bool = False,  # True for record (no lost obs); False for teleop/eval (fresh)
         reliable_action: bool = False,
-        transport_backend: str = "aiortc",  # "aiortc" (default) | "livekit"
+        transport_backend: str = "aiortc",  # "aiortc" (default) | "livekit" | "ws"
         livekit_url: str | None = None,
         livekit_token: str | None = None,
+        ws_url: str | None = None,  # ws_server_daemon url (transport_backend="ws")
+        ws_session: str | None = None,
+        ws_token: str | None = None,
+        ws_codec: str = "jpeg",  # ws video codec: "jpeg" (intra) | "h264" (inter, PyAV)
+        ws_bitrate: int = 2_000_000,  # ws h264 target bitrate
+        ws_hwaccel: bool = False,  # ws h264 publisher hw encoder (e.g. videotoolbox)
         transport: Transport | None = None,  # explicit transport overrides the backend
     ) -> None:
         self.signaling = signaling
@@ -112,6 +118,12 @@ class CaptureAgent:
             ice_servers=ice_servers,
             livekit_url=livekit_url,
             livekit_token=livekit_token,
+            ws_url=ws_url,
+            ws_session=ws_session,
+            ws_token=ws_token,
+            ws_codec=ws_codec,
+            ws_bitrate=ws_bitrate,
+            ws_hwaccel=ws_hwaccel,
         )
         self.closed = self._transport.closed  # set when the link drops
         self._transport.channel(CH_ACTION).on_message(self._on_action)

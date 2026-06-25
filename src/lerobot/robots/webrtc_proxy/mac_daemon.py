@@ -150,6 +150,9 @@ async def run_daemon(
     transport_backend: str = "aiortc",
     livekit_url: str | None = None,
     livekit_token: str | None = None,
+    ws_codec: str = "jpeg",
+    ws_bitrate: int = 2_000_000,
+    ws_hwaccel: bool = False,
     stop: asyncio.Event | None = None,
     on_agent=None,
 ) -> None:
@@ -161,10 +164,11 @@ async def run_daemon(
     motors = list(motors or SO100_MOTORS)
     stop = stop or asyncio.Event()
     while not stop.is_set():
-        # livekit does its own signaling (url+token); only aiortc needs the WS relay.
+        # Only aiortc needs the SDP signaling relay; livekit does its own signaling and the
+        # ws backend dials the data daemon itself (both get signaling=None).
         sig = (
             None
-            if transport_backend == "livekit"
+            if transport_backend in ("livekit", "ws")
             else WebSocketSignaling(signaling_url, session_id, role="robot", token=signaling_token)
         )
         agent = CaptureAgent(
@@ -186,6 +190,12 @@ async def run_daemon(
             transport_backend=transport_backend,
             livekit_url=livekit_url,
             livekit_token=livekit_token,
+            ws_url=signaling_url,  # ws backend dials the data daemon at this url
+            ws_session=session_id,
+            ws_token=signaling_token,
+            ws_codec=ws_codec,
+            ws_bitrate=ws_bitrate,
+            ws_hwaccel=ws_hwaccel,
         )
         if on_agent is not None:
             on_agent(agent)  # let a harness observe the live agent (watchdog/plan)
@@ -240,7 +250,19 @@ def main() -> None:
     parser.add_argument("--reliable-state", action="store_true", help="override: reliable state channel")
     parser.add_argument("--reliable-action", action="store_true", help="override: reliable action channel")
     parser.add_argument("--auth-token", default=None, help="shared token for the signaling relay")
-    parser.add_argument("--transport", choices=["aiortc", "livekit"], default="aiortc", help="transport backend")
+    parser.add_argument(
+        "--transport", choices=["aiortc", "livekit", "ws"], default="aiortc", help="transport backend"
+    )
+    parser.add_argument(
+        "--ws-codec",
+        choices=["jpeg", "h264"],
+        default="jpeg",
+        help="ws backend video codec: jpeg (intra) or h264 (inter, PyAV; both ends must match)",
+    )
+    parser.add_argument("--ws-bitrate", type=int, default=2_000_000, help="ws h264 target bitrate (bits/s)")
+    parser.add_argument(
+        "--ws-hwaccel", action="store_true", help="ws h264: use the platform hw encoder (e.g. videotoolbox)"
+    )
     parser.add_argument(
         "--livekit-url",
         default=os.environ.get("LIVEKIT_URL"),
@@ -271,11 +293,12 @@ def main() -> None:
     # plain basicConfig a no-op (hiding our INFO logs). Reset so daemon INFO lines show.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", force=True)
 
-    # Per-backend required args (livekit does its own signaling; aiortc needs the relay).
+    # Per-backend required args (livekit does its own signaling; aiortc/ws need a ws url:
+    # aiortc to the SDP relay, ws to the data daemon).
     livekit_token = args.livekit_token
-    if args.transport == "aiortc":
+    if args.transport in ("aiortc", "ws"):
         if not args.signaling_url:
-            parser.error("--signaling-url is required for --transport aiortc")
+            parser.error(f"--signaling-url is required for --transport {args.transport}")
     else:  # livekit: need a URL and a token (pre-signed, or self-signed from api key/secret)
         if not args.livekit_url:
             parser.error("--livekit-url (or $LIVEKIT_URL) is required for --transport livekit")
@@ -337,6 +360,9 @@ def main() -> None:
                 transport_backend=args.transport,
                 livekit_url=args.livekit_url,
                 livekit_token=livekit_token,
+                ws_codec=args.ws_codec,
+                ws_bitrate=args.ws_bitrate,
+                ws_hwaccel=args.ws_hwaccel,
             )
         )
     except KeyboardInterrupt:
